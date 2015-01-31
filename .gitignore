@@ -33,3 +33,5 @@ out
 pages
 .gradle
 build
+
+jobqueue/.settings/org.eclipse.jdt.core.prefs
