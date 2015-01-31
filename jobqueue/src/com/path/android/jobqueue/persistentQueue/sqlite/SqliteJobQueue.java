@@ -1,16 +1,5 @@
 package com.path.android.jobqueue.persistentQueue.sqlite;
 
-import android.content.Context;
-import android.database.Cursor;
-import android.database.sqlite.SQLiteDatabase;
-import android.database.sqlite.SQLiteDoneException;
-import android.database.sqlite.SQLiteStatement;
-import com.path.android.jobqueue.BaseJob;
-import com.path.android.jobqueue.JobHolder;
-import com.path.android.jobqueue.JobManager;
-import com.path.android.jobqueue.JobQueue;
-import com.path.android.jobqueue.log.JqLog;
-
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -18,6 +7,19 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
 import java.util.Collection;
+
+import android.content.Context;
+import android.database.Cursor;
+import android.database.SQLException;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteDoneException;
+import android.database.sqlite.SQLiteStatement;
+
+import com.path.android.jobqueue.BaseJob;
+import com.path.android.jobqueue.JobHolder;
+import com.path.android.jobqueue.JobManager;
+import com.path.android.jobqueue.JobQueue;
+import com.path.android.jobqueue.log.JqLog;
 
 /**
  * Persistent Job Queue that keeps its data in an sqlite database.
@@ -53,11 +55,19 @@ public class SqliteJobQueue implements JobQueue {
     @Override
     public long insert(JobHolder jobHolder) {
         SQLiteStatement stmt = sqlHelper.getInsertStatement();
-        long id;
+        long id = -1;
         synchronized (stmt) {
-            stmt.clearBindings();
-            bindValues(stmt, jobHolder);
-            id = stmt.executeInsert();
+            db.beginTransaction();
+            try {
+                stmt.clearBindings();
+                bindValues(stmt, jobHolder);
+                id = stmt.executeInsert();
+                db.setTransactionSuccessful();
+            } catch (SQLException e) {
+                JqLog.e(e, "called insert with sql exception.");
+            } finally {
+                db.endTransaction();
+            }
         }
         jobHolder.setId(id);
         return id;
@@ -92,11 +102,19 @@ public class SqliteJobQueue implements JobQueue {
         }
         jobHolder.setRunningSessionId(JobManager.NOT_RUNNING_SESSION_ID);
         SQLiteStatement stmt = sqlHelper.getInsertOrReplaceStatement();
-        long id;
+        long id = -1;
         synchronized (stmt) {
-            stmt.clearBindings();
-            bindValues(stmt, jobHolder);
-            id = stmt.executeInsert();
+            db.beginTransaction();
+            try {
+                stmt.clearBindings();
+                bindValues(stmt, jobHolder);
+                id = stmt.executeInsert();
+                db.setTransactionSuccessful();
+            } catch (SQLException e) {
+                JqLog.e(e, "called insertOrReplace with sql exception.");
+            } finally {
+                db.endTransaction();
+            }
         }
         jobHolder.setId(id);
         return id;
@@ -117,9 +135,17 @@ public class SqliteJobQueue implements JobQueue {
     private void delete(Long id) {
         SQLiteStatement stmt = sqlHelper.getDeleteStatement();
         synchronized (stmt) {
-            stmt.clearBindings();
-            stmt.bindLong(1, id);
-            stmt.execute();
+            db.beginTransaction();
+            try {
+                stmt.clearBindings();
+                stmt.bindLong(1, id);
+                stmt.execute();
+                db.setTransactionSuccessful();
+            } catch (SQLException e) {
+                JqLog.e(e, "called delete with sql exception.");
+            } finally {
+                db.endTransaction();
+            }
         }
     }
 
@@ -270,7 +296,15 @@ public class SqliteJobQueue implements JobQueue {
      */
     @Override
     public void clear() {
-        sqlHelper.truncate();
+        db.beginTransaction();
+        try {
+            sqlHelper.truncate();
+            db.setTransactionSuccessful();
+        } catch (SQLException e) {
+            JqLog.e(e, "called clear with sql exception.");
+        } finally {
+            db.endTransaction();
+        }
         readyJobsQueryCache.clear();
         nextJobsQueryCache.clear();
     }
@@ -280,11 +314,19 @@ public class SqliteJobQueue implements JobQueue {
         jobHolder.setRunCount(jobHolder.getRunCount() + 1);
         jobHolder.setRunningSessionId(sessionId);
         synchronized (stmt) {
-            stmt.clearBindings();
-            stmt.bindLong(1, jobHolder.getRunCount());
-            stmt.bindLong(2, sessionId);
-            stmt.bindLong(3, jobHolder.getId());
-            stmt.execute();
+            db.beginTransaction();
+            try {
+                stmt.clearBindings();
+                stmt.bindLong(1, jobHolder.getRunCount());
+                stmt.bindLong(2, sessionId);
+                stmt.bindLong(3, jobHolder.getId());
+                stmt.execute();
+                db.setTransactionSuccessful();
+            } catch (SQLException e) {
+                JqLog.e(e, "called onJobFetchedForRunning with sql exception.");
+            } finally {
+                db.endTransaction();
+            }
         }
     }
 
