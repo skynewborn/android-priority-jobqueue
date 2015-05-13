@@ -1,9 +1,35 @@
 package com.path.android.jobqueue;
 
+import com.path.android.jobqueue.log.JqLog;
+
+import java.util.Collections;
+import java.util.Set;
+
 /**
  * Container class to address Jobs inside job manager.
  */
 public class JobHolder {
+
+    /**
+     * Internal constant. Job's onRun method completed w/o any exception.
+     */
+    public static final int RUN_RESULT_SUCCESS = 1;
+    /**
+     * Internal constant. Job's onRun method thrown an exception and either it does not want to
+     * run again or reached retry limit.
+     */
+    public static final int RUN_RESULT_FAIL_RUN_LIMIT = 2;
+
+    /**
+     * Internal constant. Job's onRun method has thrown an exception and it was cancelled after it
+     * started.
+     */
+    public static final int RUN_RESULT_FAIL_FOR_CANCEL = 3;
+    /**
+     * Internal constant. Job's onRun method failed but wants to retry.
+     */
+    public static final int RUN_RESULT_TRY_AGAIN = 4;
+
     protected Long id;
     protected int priority;
     protected String groupId;
@@ -19,45 +45,49 @@ public class JobHolder {
     protected long createdNs;
     protected long runningSessionId;
     protected boolean requiresNetwork;
-    transient BaseJob baseJob;
+    transient Job job;
+    protected final Set<String> tags;
+    private boolean cancelled;
+    private boolean successful;
 
     /**
      * @param id               Unique ID for the job. Should be unique per queue
      * @param priority         Higher is better
      * @param groupId          which group does this job belong to? default null
      * @param runCount         Incremented each time job is fetched to run, initial value should be 0
-     * @param baseJob          Actual job to run
+     * @param job              Actual job to run
      * @param createdNs        System.nanotime
      * @param delayUntilNs     System.nanotime value where job can be run the very first time
      * @param runningSessionId
      */
-    public JobHolder(Long id, int priority, String groupId, int runCount, BaseJob baseJob, long createdNs, long delayUntilNs, long runningSessionId) {
+    public JobHolder(Long id, int priority, String groupId, int runCount, Job job, long createdNs, long delayUntilNs, long runningSessionId) {
         this.id = id;
         this.priority = priority;
         this.groupId = groupId;
         this.runCount = runCount;
         this.createdNs = createdNs;
         this.delayUntilNs = delayUntilNs;
-        this.baseJob = baseJob;
+        this.job = job;
         this.runningSessionId = runningSessionId;
-        this.requiresNetwork = baseJob.requiresNetwork();
+        this.requiresNetwork = job.requiresNetwork();
+        this.tags = job.getTags() == null ? null : Collections.unmodifiableSet(job.getTags());
     }
 
-    public JobHolder(int priority, BaseJob baseJob, long runningSessionId) {
-        this(null, priority, null, 0, baseJob, System.nanoTime(), Long.MIN_VALUE, runningSessionId);
+    public JobHolder(int priority, Job job, long runningSessionId) {
+        this(null, priority, null, 0, job, System.nanoTime(), Long.MIN_VALUE, runningSessionId);
     }
 
-    public JobHolder(int priority, BaseJob baseJob, long delayUntilNs, long runningSessionId) {
-        this(null, priority, baseJob.getRunGroupId(), 0, baseJob, System.nanoTime(), delayUntilNs, runningSessionId);
+    public JobHolder(int priority, Job job, long delayUntilNs, long runningSessionId) {
+        this(null, priority, job.getRunGroupId(), 0, job, System.nanoTime(), delayUntilNs, runningSessionId);
     }
 
     /**
      * runs the job w/o throwing any exceptions
      * @param currentRunCount
-     * @return
+     * @return RUN_RESULT*
      */
-    public final boolean safeRun(int currentRunCount) {
-        return baseJob.safeRun(currentRunCount);
+    public final int safeRun(int currentRunCount) {
+        return job.safeRun(this, currentRunCount);
     }
 
     public Long getId() {
@@ -108,16 +138,29 @@ public class JobHolder {
         return delayUntilNs;
     }
 
-    public BaseJob getBaseJob() {
-        return baseJob;
+    public Job getJob() {
+        return job;
     }
 
-    public void setBaseJob(BaseJob baseJob) {
-        this.baseJob = baseJob;
+    public void setJob(Job job) {
+        this.job = job;
     }
 
     public String getGroupId() {
         return groupId;
+    }
+
+    public Set<String> getTags() {
+        return tags;
+    }
+
+    public void markAsCancelled() {
+        cancelled = true;
+        job.cancelled = true;
+    }
+
+    public boolean isCancelled() {
+        return cancelled;
     }
 
     @Override
@@ -139,5 +182,17 @@ public class JobHolder {
             return false;
         }
         return id.equals(other.id);
+    }
+
+    public boolean hasTags() {
+        return tags != null && tags.size() > 0;
+    }
+
+    public synchronized void markAsSuccessful() {
+        successful = true;
+    }
+
+    public synchronized boolean isSuccessful() {
+        return successful;
     }
 }

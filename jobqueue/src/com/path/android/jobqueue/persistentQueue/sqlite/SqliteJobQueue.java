@@ -1,13 +1,5 @@
 package com.path.android.jobqueue.persistentQueue.sqlite;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutput;
-import java.io.ObjectOutputStream;
-import java.util.Collection;
-
 import android.content.Context;
 import android.database.Cursor;
 import android.database.SQLException;
@@ -15,11 +7,19 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteDoneException;
 import android.database.sqlite.SQLiteStatement;
 
-import com.path.android.jobqueue.BaseJob;
-import com.path.android.jobqueue.JobHolder;
-import com.path.android.jobqueue.JobManager;
-import com.path.android.jobqueue.JobQueue;
+import com.path.android.jobqueue.*;
 import com.path.android.jobqueue.log.JqLog;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutput;
+import java.io.ObjectOutputStream;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Persistent Job Queue that keeps its data in an sqlite database.
@@ -32,17 +32,24 @@ public class SqliteJobQueue implements JobQueue {
     JobSerializer jobSerializer;
     QueryCache readyJobsQueryCache;
     QueryCache nextJobsQueryCache;
+    // we keep a list of cancelled jobs in memory not to return them in subsequent find by tag
+    // queries. Set is cleaned when item is removed
+    Set<Long> pendingCancelations = new HashSet<Long>();
 
     /**
      * @param context application context
      * @param sessionId session id should match {@link JobManager}
      * @param id uses this value to construct database name {@code "db_" + id}
+     * @param jobSerializer The serializer to use while persisting jobs to database
+     * @param inTestMode If true, creates a memory only database
      */
-    public SqliteJobQueue(Context context, long sessionId, String id, JobSerializer jobSerializer) {
+    public SqliteJobQueue(Context context, long sessionId, String id, JobSerializer jobSerializer,
+            boolean inTestMode) {
         this.sessionId = sessionId;
-        dbOpenHelper = new DbOpenHelper(context, "db_" + id);
+        dbOpenHelper = new DbOpenHelper(context, inTestMode ? null : ("db_" + id));
         db = dbOpenHelper.getWritableDatabase();
-        sqlHelper = new SqlHelper(db, DbOpenHelper.JOB_HOLDER_TABLE_NAME, DbOpenHelper.ID_COLUMN.columnName, DbOpenHelper.COLUMN_COUNT, sessionId);
+        sqlHelper = new SqlHelper(db, DbOpenHelper.JOB_HOLDER_TABLE_NAME, DbOpenHelper.ID_COLUMN.columnName, DbOpenHelper.COLUMN_COUNT,
+                DbOpenHelper.JOB_TAGS_TABLE_NAME, DbOpenHelper.TAGS_COLUMN_COUNT, sessionId);
         this.jobSerializer = jobSerializer;
         readyJobsQueryCache = new QueryCache();
         nextJobsQueryCache = new QueryCache();
@@ -54,7 +61,10 @@ public class SqliteJobQueue implements JobQueue {
      */
     @Override
     public long insert(JobHolder jobHolder) {
-        SQLiteStatement stmt = sqlHelper.getInsertStatement();
+        if (jobHolder.hasTags()) {
+            return insertWithTags(jobHolder);
+        }
+        final SQLiteStatement stmt = sqlHelper.getInsertStatement();
         long id = -1;
         synchronized (stmt) {
             db.beginTransaction();
@@ -73,6 +83,37 @@ public class SqliteJobQueue implements JobQueue {
         return id;
     }
 
+    private long insertWithTags(JobHolder jobHolder) {
+        final SQLiteStatement stmt = sqlHelper.getInsertStatement();
+        final SQLiteStatement tagsStmt = sqlHelper.getInsertTagsStatement();
+        long id = -1;
+        synchronized (stmt) {
+            db.beginTransaction();
+            try {
+                stmt.clearBindings();
+                bindValues(stmt, jobHolder);
+                id = stmt.executeInsert();
+                for (String tag : jobHolder.getTags()) {
+                    tagsStmt.clearBindings();
+                    bindTag(tagsStmt, id, tag);
+                    tagsStmt.executeInsert();
+                }
+                db.setTransactionSuccessful();
+            } catch (SQLException e) {
+                JqLog.e(e, "called insertWithTags with sql exception.");
+            } finally {
+                db.endTransaction();
+            }
+        }
+        jobHolder.setId(id);
+        return id;
+    }
+
+    private void bindTag(SQLiteStatement stmt, long jobId, String tag) {
+        stmt.bindLong(DbOpenHelper.TAGS_JOB_ID_COLUMN.columnIndex + 1, jobId);
+        stmt.bindString(DbOpenHelper.TAGS_NAME_COLUMN.columnIndex + 1, tag);
+    }
+
     private void bindValues(SQLiteStatement stmt, JobHolder jobHolder) {
         if (jobHolder.getId() != null) {
             stmt.bindLong(DbOpenHelper.ID_COLUMN.columnIndex + 1, jobHolder.getId());
@@ -82,9 +123,9 @@ public class SqliteJobQueue implements JobQueue {
             stmt.bindString(DbOpenHelper.GROUP_ID_COLUMN.columnIndex + 1, jobHolder.getGroupId());
         }
         stmt.bindLong(DbOpenHelper.RUN_COUNT_COLUMN.columnIndex + 1, jobHolder.getRunCount());
-        byte[] baseJob = getSerializeBaseJob(jobHolder);
-        if (baseJob != null) {
-            stmt.bindBlob(DbOpenHelper.BASE_JOB_COLUMN.columnIndex + 1, baseJob);
+        byte[] job = getSerializeJob(jobHolder);
+        if (job != null) {
+            stmt.bindBlob(DbOpenHelper.BASE_JOB_COLUMN.columnIndex + 1, job);
         }
         stmt.bindLong(DbOpenHelper.CREATED_NS_COLUMN.columnIndex + 1, jobHolder.getCreatedNs());
         stmt.bindLong(DbOpenHelper.DELAY_UNTIL_NS_COLUMN.columnIndex + 1, jobHolder.getDelayUntilNs());
@@ -133,6 +174,7 @@ public class SqliteJobQueue implements JobQueue {
     }
 
     private void delete(Long id) {
+        pendingCancelations.remove(id);
         SQLiteStatement stmt = sqlHelper.getDeleteStatement();
         synchronized (stmt) {
             db.beginTransaction();
@@ -196,12 +238,61 @@ public class SqliteJobQueue implements JobQueue {
                 return null;
             }
             return createJobHolderFromCursor(cursor);
-        } catch (InvalidBaseJobException e) {
+        } catch (InvalidJobException e) {
             JqLog.e(e, "invalid job on findJobById");
             return null;
         } finally {
             cursor.close();
         }
+    }
+
+    @Override
+    public Set<JobHolder> findJobsByTags(TagConstraint tagConstraint, boolean excludeCancelled,
+            Collection<Long> exclude, String... tags) {
+        if (tags == null || tags.length == 0) {
+            return Collections.emptySet();
+        }
+        Set<JobHolder> jobs = new HashSet<JobHolder>();
+        int excludeCount = exclude == null ? 0 : exclude.size();
+        if (excludeCancelled) {
+            excludeCount += pendingCancelations.size();
+        }
+        final String query = sqlHelper.createFindByTagsQuery(tagConstraint,
+                excludeCount, tags.length);
+        JqLog.d(query);
+        final String[] args;
+        if (excludeCount == 0) {
+            args = tags;
+        } else {
+            args = new String[excludeCount + tags.length];
+            System.arraycopy(tags, 0, args, 0, tags.length);
+            int i = tags.length;
+            for (Long ex : exclude) {
+                args[i ++] = ex.toString();
+            }
+            if (excludeCancelled) {
+                for (Long ex : pendingCancelations) {
+                    args[i ++] = ex.toString();
+                }
+            }
+        }
+        Cursor cursor = db.rawQuery(query, args);
+        try {
+            while (cursor.moveToNext()) {
+                jobs.add(createJobHolderFromCursor(cursor));
+            }
+        } catch (InvalidJobException e) {
+            JqLog.e(e, "invalid job found by tags.");
+        } finally {
+            cursor.close();
+        }
+        return jobs;
+    }
+
+    @Override
+    public void onJobCancelled(JobHolder holder) {
+        pendingCancelations.add(holder.getId());
+        setSessionIdOnJob(holder);
     }
 
     /**
@@ -228,9 +319,9 @@ public class SqliteJobQueue implements JobQueue {
                 return null;
             }
             JobHolder holder = createJobHolderFromCursor(cursor);
-            onJobFetchedForRunning(holder);
+            setSessionIdOnJob(holder);
             return holder;
-        } catch (InvalidBaseJobException e) {
+        } catch (InvalidJobException e) {
             //delete
             Long jobId = cursor.getLong(0);
             delete(jobId);
@@ -309,7 +400,15 @@ public class SqliteJobQueue implements JobQueue {
         nextJobsQueryCache.clear();
     }
 
-    private void onJobFetchedForRunning(JobHolder jobHolder) {
+    /**
+     * This method is called when a job is pulled to run.
+     * It is properly marked so that it won't be returned from next job queries.
+     * <p/>
+     * Same mechanism is also used for cancelled jobs.
+     *
+     * @param jobHolder
+     */
+    private void setSessionIdOnJob(JobHolder jobHolder) {
         SQLiteStatement stmt = sqlHelper.getOnJobFetchedForRunningStatement();
         jobHolder.setRunCount(jobHolder.getRunCount() + 1);
         jobHolder.setRunningSessionId(sessionId);
@@ -323,17 +422,17 @@ public class SqliteJobQueue implements JobQueue {
                 stmt.execute();
                 db.setTransactionSuccessful();
             } catch (SQLException e) {
-                JqLog.e(e, "called onJobFetchedForRunning with sql exception.");
+                JqLog.e(e, "called setSessionIdOnJob with sql exception.");
             } finally {
                 db.endTransaction();
             }
         }
     }
 
-    private JobHolder createJobHolderFromCursor(Cursor cursor) throws InvalidBaseJobException {
-        BaseJob job = safeDeserialize(cursor.getBlob(DbOpenHelper.BASE_JOB_COLUMN.columnIndex));
+    private JobHolder createJobHolderFromCursor(Cursor cursor) throws InvalidJobException {
+        Job job = safeDeserialize(cursor.getBlob(DbOpenHelper.BASE_JOB_COLUMN.columnIndex));
         if (job == null) {
-            throw new InvalidBaseJobException();
+            throw new InvalidJobException();
         }
         return new JobHolder(
                 cursor.getLong(DbOpenHelper.ID_COLUMN.columnIndex),
@@ -348,7 +447,7 @@ public class SqliteJobQueue implements JobQueue {
 
     }
 
-    private BaseJob safeDeserialize(byte[] bytes) {
+    private Job safeDeserialize(byte[] bytes) {
         try {
             return jobSerializer.deserialize(bytes);
         } catch (Throwable t) {
@@ -357,8 +456,8 @@ public class SqliteJobQueue implements JobQueue {
         return null;
     }
 
-    private byte[] getSerializeBaseJob(JobHolder jobHolder) {
-        return safeSerialize(jobHolder.getBaseJob());
+    private byte[] getSerializeJob(JobHolder jobHolder) {
+        return safeSerialize(jobHolder.getJob());
     }
 
     private byte[] safeSerialize(Object object) {
@@ -370,7 +469,9 @@ public class SqliteJobQueue implements JobQueue {
         return null;
     }
 
-    private static class InvalidBaseJobException extends Exception {
+    private static class InvalidJobException extends Exception {
+
+        private static final long serialVersionUID = -5825656163831895628L;
 
     }
 
@@ -397,7 +498,7 @@ public class SqliteJobQueue implements JobQueue {
         }
 
         @Override
-        public <T extends BaseJob> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException {
+        public <T extends Job> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException {
             if (bytes == null || bytes.length == 0) {
                 return null;
             }
@@ -415,6 +516,6 @@ public class SqliteJobQueue implements JobQueue {
 
     public static interface JobSerializer {
         public byte[] serialize(Object object) throws IOException;
-        public <T extends BaseJob> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException;
+        public <T extends Job> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException;
     }
 }

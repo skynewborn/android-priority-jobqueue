@@ -1,6 +1,7 @@
 package com.path.android.jobqueue;
 
 import android.content.Context;
+
 import com.path.android.jobqueue.cachedQueue.CachedJobQueue;
 import com.path.android.jobqueue.config.Configuration;
 import com.path.android.jobqueue.di.DependencyInjector;
@@ -11,7 +12,12 @@ import com.path.android.jobqueue.network.NetworkUtil;
 import com.path.android.jobqueue.nonPersistentQueue.NonPersistentPriorityQueue;
 import com.path.android.jobqueue.persistentQueue.sqlite.SqliteJobQueue;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.*;
 
 /**
@@ -28,7 +34,7 @@ public class JobManager implements NetworkEventProvider.Listener {
     public static final long NOT_DELAYED_JOB_DELAY = Long.MIN_VALUE;
     @SuppressWarnings("FieldCanBeLocal")//used for testing
     private final long sessionId;
-    private boolean running;
+    private volatile boolean running;
 
     private final Context appContext;
     private final NetworkUtil networkUtil;
@@ -40,7 +46,9 @@ public class JobManager implements NetworkEventProvider.Listener {
     private final Object newJobListeners = new Object();
     private final ConcurrentHashMap<Long, CountDownLatch> persistentOnAddedLocks;
     private final ConcurrentHashMap<Long, CountDownLatch> nonPersistentOnAddedLocks;
-    private final ScheduledExecutorService timedExecutor;
+    private ScheduledExecutorService timedExecutor;
+    // lazily created
+    private Executor cancelExecutor;
     private final Object getNextJobLock = new Object();
 
     /**
@@ -74,8 +82,10 @@ public class JobManager implements NetworkEventProvider.Listener {
         running = true;
         runningJobGroups = new CopyOnWriteGroupSet();
         sessionId = System.nanoTime();
-        this.persistentJobQueue = config.getQueueFactory().createPersistentQueue(context, sessionId, config.getId());
-        this.nonPersistentJobQueue = config.getQueueFactory().createNonPersistent(context, sessionId, config.getId());
+        this.persistentJobQueue = config.getQueueFactory()
+                .createPersistentQueue(context, sessionId, config.getId(), config.isInTestMode());
+        this.nonPersistentJobQueue = config.getQueueFactory()
+                .createNonPersistent(context, sessionId, config.getId(), config.isInTestMode());
         persistentOnAddedLocks = new ConcurrentHashMap<Long, CountDownLatch>();
         nonPersistentOnAddedLocks = new ConcurrentHashMap<Long, CountDownLatch>();
 
@@ -144,7 +154,224 @@ public class JobManager implements NetworkEventProvider.Listener {
      */
     public long addJob(Job job) {
         //noinspection deprecation
-        return addJob(job.getPriority(), job.getDelayInMs(), job);
+        JobHolder jobHolder = new JobHolder(job.getPriority(), job
+                , job.getDelayInMs() > 0 ? System.nanoTime() + job.getDelayInMs() * NS_PER_MS : NOT_DELAYED_JOB_DELAY
+                , NOT_RUNNING_SESSION_ID);
+        long id;
+        if (job.isPersistent()) {
+            synchronized (persistentJobQueue) {
+                id = persistentJobQueue.insert(jobHolder);
+                addOnAddedLock(persistentOnAddedLocks, id);
+            }
+        } else {
+            synchronized (nonPersistentJobQueue) {
+                id = nonPersistentJobQueue.insert(jobHolder);
+                addOnAddedLock(nonPersistentOnAddedLocks, id);
+            }
+        }
+        if(JqLog.isDebugEnabled()) {
+            JqLog.d("added job id: %d class: %s priority: %d delay: %d group : %s persistent: %s requires network: %s"
+                    , id, job.getClass().getSimpleName(), job.getPriority(), job.getDelayInMs(), job.getRunGroupId()
+                    , job.isPersistent(), job.requiresNetwork());
+        }
+        if(dependencyInjector != null) {
+            //inject members b4 calling onAdded
+            dependencyInjector.inject(job);
+        }
+        jobHolder.getJob().onAdded();
+        if(job.isPersistent()) {
+            synchronized (persistentJobQueue) {
+                clearOnAddedLock(persistentOnAddedLocks, id);
+            }
+        } else {
+            synchronized (nonPersistentJobQueue) {
+                clearOnAddedLock(nonPersistentOnAddedLocks, id);
+            }
+        }
+        notifyJobConsumer();
+        return id;
+    }
+
+    /**
+     * Cancels all jobs matching the list of tags.
+     * <p>
+     * Note that, if any of the matching jobs is running, this method WILL wait for them to finish
+     * or fail.
+     * <p>
+     * This method uses a separate single threaded executor pool just for cancelling jobs
+     * because it may potentially wait for a long running job (if query matches that job). This
+     * pool is lazily created when the very first cancel request arrives.
+     * <p>
+     * A job may be already running when cancelJob is called. In this case, JobManager will wait
+     * until job fails or ends before returning from this method. If jobs succeeds before
+     * JobManager can cancel it, it will be added into {@link CancelResult#getFailedToCancel()}
+     * list.
+     * <p>
+     * If you call {@link #addJob(Job)} while {@link #cancelJobs(TagConstraint, String...)} is
+     * running, the behavior of that job will be undefined. If that jobs gets added to the queue
+     * before cancel query runs, it may be cancelled before running. It is up to you to sync these
+     * two requests if such cases may happen for you.
+     * <p/>
+     * This query is not atomic. If application terminates while jobs are being cancelled, some of
+     * them may be cancelled while some remain in the queue (for persistent jobs).
+     * <p/>
+     * This method guarantees calling {@link Job#onCancel()} before job is removed
+     * from the queue. If application terminates while {@link Job#onCancel()} is running, the
+     * Job will not be removed from disk (same behavior with jobs failing due to other reasons like
+     * hitting retry limit).
+     *
+     * @param constraint The constraint to use while selecting jobs. If set to {@link TagConstraint#ANY},
+     *                   any job that has one of the given tags will be cancelled. If set to
+     *                   {@link TagConstraint#ALL}, jobs that has all of the given tags will be cancelled.
+     * @param tags The list of tags
+     */
+    public void cancelJobsInBackground(final CancelResult.AsyncCancelCallback cancelCallback,
+            final TagConstraint constraint, final String... tags) {
+        synchronized (this) {
+            if (cancelExecutor == null) {
+                cancelExecutor = Executors.newSingleThreadExecutor();
+            }
+            cancelExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    CancelResult result = cancelJobs(constraint, tags);
+                    if (cancelCallback != null) {
+                        cancelCallback.onCancelled(result);
+                    }
+                }
+            });
+        }
+    }
+
+    /**
+     * Cancel all jobs matching the list of tags.
+     * <p>
+     * Note that, you should NOT call this method on main thread because it queries database and
+     * may also need to wait for running jobs to finish.
+     * <p>
+     * A job may be already running when cancelJob is called. In this case, JobManager will wait
+     * until job fails or ends before returning from this method. If jobs succeeds before
+     * JobManager can cancel it, it will be added into {@link CancelResult#getFailedToCancel()}
+     * list.
+     * <p>
+     * If you call {@link #addJob(Job)} while {@link #cancelJobs(TagConstraint, String...)} is
+     * running, the behavior of that job will be undefined. If that jobs gets added to the queue
+     * before cancel query runs, it may be cancelled before running. It is up to you to sync these
+     * two requests if such cases may happen for you.
+     * <p/>
+     * This query is not atomic. If application terminates while jobs are being cancelled, some of
+     * them may be cancelled while some remain in the queue (for persistent jobs).
+     * <p/>
+     * This method guarantees calling {@link Job#onCancel()} before job is removed
+     * from the queue. If application terminates while {@link Job#onCancel()} is running, the
+     * Job will not be removed from disk (same behavior with jobs failing due to other reasons like
+     * hitting retry limit).
+     *
+     * @param constraint The constraint to use while selecting jobs. If set to {@link TagConstraint#ANY},
+     *                   any job that has one of the given tags will be cancelled. If set to
+     *                   {@link TagConstraint#ALL}, jobs that has all of the given tags will be cancelled.
+     * @param tags       The list of tags
+     * @return A Cancel result containing the list of jobs.
+     * @see #cancelJobsInBackground(CancelResult.AsyncCancelCallback, TagConstraint, String...)
+     */
+    public CancelResult cancelJobs(final TagConstraint constraint, final String... tags) {
+        final List<JobHolder> jobs = new ArrayList<JobHolder>();
+        final Set<Long> persistentJobIds = new HashSet<Long>();
+        final Set<Long> nonPersistentJobIds = new HashSet<Long>();
+        final Set<Long> runningNonPersistentJobIds = new HashSet<>();
+        final Set<Long> runningPersistentJobIds = new HashSet<>();
+        synchronized (getNextJobLock) {
+            jobConsumerExecutor.inRunningJobHoldersLock(new Runnable() {
+                @Override
+                public void run() {
+                    // TODO if app terminates while cancelling, job will be removed w/o receiving an onCancel call!!!
+                    Set<JobHolder> nonPersistentRunningJobs = jobConsumerExecutor
+                            .findRunningByTags(constraint, tags, false);
+                    synchronized (nonPersistentJobQueue) {
+                        markJobsAsCancelledAndFilterAlreadyCancelled(nonPersistentRunningJobs,
+                                nonPersistentJobQueue, nonPersistentJobIds);
+                        runningNonPersistentJobIds.addAll(nonPersistentJobIds);
+                        Set<JobHolder> nonPersistentJobs = nonPersistentJobQueue
+                                .findJobsByTags(constraint, true, nonPersistentJobIds, tags);
+                        markJobsAsCancelledAndFilterAlreadyCancelled(nonPersistentJobs,
+                                nonPersistentJobQueue, nonPersistentJobIds);
+                        jobs.addAll(nonPersistentJobs);
+                    }
+                    jobs.addAll(nonPersistentRunningJobs);
+
+                    Set<JobHolder> persistentRunningJobs = jobConsumerExecutor
+                            .findRunningByTags(constraint, tags, true);
+                    synchronized (persistentJobQueue) {
+                        markJobsAsCancelledAndFilterAlreadyCancelled(persistentRunningJobs,
+                                persistentJobQueue, persistentJobIds);
+                        runningPersistentJobIds.addAll(persistentJobIds);
+                        Set<JobHolder> persistentJobs = persistentJobQueue
+                                .findJobsByTags(constraint, true, persistentJobIds, tags);
+                        markJobsAsCancelledAndFilterAlreadyCancelled(persistentJobs,
+                                persistentJobQueue, persistentJobIds);
+                        jobs.addAll(persistentJobs);
+                    }
+                    jobs.addAll(persistentRunningJobs);
+                }
+            });
+        }
+
+        try {
+            // non persistent jobs are removed from queue as soon as they are marked as cancelled
+            // persistent jobs are given a running session id upon cancellation.
+            // this ensures that these jobs won't show up in next job queries.
+            // if subsequent cancel requests come for these jobs, they won't show up again either
+            // because markJobsAsCancelledAndFilterAlreadyCancelled will filter them out
+            jobConsumerExecutor.waitUntilDone(persistentJobIds, nonPersistentJobIds);
+        } catch (InterruptedException e) {
+            JqLog.e(e, "error while waiting for jobs to finish");
+        }
+        CancelResult result = new CancelResult();
+        for (JobHolder holder : jobs) {
+            JqLog.d("checking if I could cancel %s. Result: %s", holder.getJob(), !holder.isSuccessful());
+            if (holder.isSuccessful()) {
+                result.failedToCancel.add(holder.getJob());
+            } else {
+                result.cancelledJobs.add(holder.getJob());
+                try {
+                    holder.getJob().onCancel();
+                } catch (Throwable t) {
+                    JqLog.e(t, "cancelled job's onCancel has thrown exception");
+                }
+                // if job is removed while running, make sure we remove it from running job
+                // groups as well. JobExecutor won't remove the job.
+                if (holder.getJob().isPersistent()) {
+                    synchronized (persistentJobQueue) {
+                        persistentJobQueue.remove(holder);
+                    }
+                    if (holder.getGroupId() != null &&
+                            runningPersistentJobIds.contains(holder.getId())) {
+                        runningJobGroups.remove(holder.getGroupId());
+                    }
+                } else if (holder.getGroupId() != null &&
+                        runningNonPersistentJobIds.contains(holder.getId())) {
+                    runningJobGroups.remove(holder.getGroupId());
+                }
+            }
+        }
+        return result;
+    }
+
+    private void markJobsAsCancelledAndFilterAlreadyCancelled(Set<JobHolder> jobs, JobQueue queue,
+            Set<Long> outIds) {
+        Iterator<JobHolder> itr = jobs.iterator();
+        while (itr.hasNext()) {
+            JobHolder holder = itr.next();
+            // although cancelled is not persistent to disk, this will still work because we would
+            // receive the same job back if it was just cancelled in this session.
+            if (holder.isCancelled()) {
+                itr.remove();
+            } else {
+                holder.markAsCancelled();
+                outIds.add(holder.getId());
+                queue.onJobCancelled(holder);
+            }
+        }
     }
 
     /**
@@ -155,11 +382,23 @@ public class JobManager implements NetworkEventProvider.Listener {
      */
     public void addJobInBackground(Job job) {
         //noinspection deprecation
-        addJobInBackground(job.getPriority(), job.getDelayInMs(), job);
+        addJobInBackground(job, null);
     }
 
-    public void addJobInBackground(Job job, /*nullable*/ AsyncAddCallback callback) {
-        addJobInBackground(job.getPriority(), job.getDelayInMs(), job, callback);
+    public void addJobInBackground(final Job job, /*nullable*/ final AsyncAddCallback callback) {
+        timedExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long id = addJob(job);
+                    if(callback != null) {
+                        callback.onAdded(id);
+                    }
+                } catch (Throwable t) {
+                    JqLog.e(t, "addJobInBackground received an exception. job class: %s", job.getClass().getSimpleName());
+                }
+            }
+        });
     }
 
     //need to sync on related job queue before calling this
@@ -263,14 +502,14 @@ public class JobManager implements NetworkEventProvider.Listener {
         JobHolder jobHolder;
         boolean persistent = false;
         synchronized (getNextJobLock) {
-            final Collection<String> runningJobIds = runningJobGroups.getSafe();
+            final Collection<String> runningJobGroups = this.runningJobGroups.getSafe();
             synchronized (nonPersistentJobQueue) {
-                jobHolder = nonPersistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobIds);
+                jobHolder = nonPersistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobGroups);
             }
             if (jobHolder == null) {
                 //go to disk, there aren't any non-persistent jobs
                 synchronized (persistentJobQueue) {
-                    jobHolder = persistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobIds);
+                    jobHolder = persistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobGroups);
                     persistent = true;
                 }
             }
@@ -278,10 +517,10 @@ public class JobManager implements NetworkEventProvider.Listener {
                 return null;
             }
             if(persistent && dependencyInjector != null) {
-                dependencyInjector.inject(jobHolder.getBaseJob());
+                dependencyInjector.inject(jobHolder.getJob());
             }
             if(jobHolder.getGroupId() != null) {
-                runningJobGroups.add(jobHolder.getGroupId());
+                this.runningJobGroups.add(jobHolder.getGroupId());
             }
         }
 
@@ -297,14 +536,18 @@ public class JobManager implements NetworkEventProvider.Listener {
 
     private void reAddJob(JobHolder jobHolder) {
         JqLog.d("re-adding job %s", jobHolder.getId());
-        if (jobHolder.getBaseJob().isPersistent()) {
-            synchronized (persistentJobQueue) {
-                persistentJobQueue.insertOrReplace(jobHolder);
+        if (!jobHolder.isCancelled()) {
+            if (jobHolder.getJob().isPersistent()) {
+                synchronized (persistentJobQueue) {
+                    persistentJobQueue.insertOrReplace(jobHolder);
+                }
+            } else {
+                synchronized (nonPersistentJobQueue) {
+                    nonPersistentJobQueue.insertOrReplace(jobHolder);
+                }
             }
         } else {
-            synchronized (nonPersistentJobQueue) {
-                nonPersistentJobQueue.insertOrReplace(jobHolder);
-            }
+            JqLog.d("not re-adding cancelled job " + jobHolder);
         }
         if(jobHolder.getGroupId() != null) {
             runningJobGroups.remove(jobHolder.getGroupId());
@@ -354,7 +597,7 @@ public class JobManager implements NetworkEventProvider.Listener {
     }
 
     private void removeJob(JobHolder jobHolder) {
-        if (jobHolder.getBaseJob().isPersistent()) {
+        if (jobHolder.getJob().isPersistent()) {
             synchronized (persistentJobQueue) {
                 persistentJobQueue.remove(jobHolder);
             }
@@ -366,6 +609,16 @@ public class JobManager implements NetworkEventProvider.Listener {
         if(jobHolder.getGroupId() != null) {
             runningJobGroups.remove(jobHolder.getGroupId());
         }
+    }
+
+    public synchronized void stopAndWaitUntilConsumersAreFinished() throws InterruptedException {
+        stop();
+        timedExecutor.shutdownNow();
+        synchronized (newJobListeners) {
+            newJobListeners.notifyAll();
+        }
+        jobConsumerExecutor.waitUntilAllConsumersAreFinished();
+        timedExecutor = Executors.newSingleThreadScheduledExecutor();
     }
 
     public synchronized void clear() {
@@ -418,7 +671,7 @@ public class JobManager implements NetworkEventProvider.Listener {
             long waitUntil = remainingWait + start;
             //for delayed jobs,
             long nextJobDelay = ensureConsumerWhenNeeded(null);
-            while (nextJob == null && waitUntil > System.nanoTime()) {
+            while (nextJob == null && waitUntil > System.nanoTime() && running) {
                 //keep running inside here to avoid busy loop
                 nextJob = running ? JobManager.this.getNextJob() : null;
                 if(nextJob == null) {
@@ -427,7 +680,7 @@ public class JobManager implements NetworkEventProvider.Listener {
                         //if we can't detect network changes, we won't be notified.
                         //to avoid waiting up to give time, wait in chunks of 500 ms max
                         long maxWait = Math.min(nextJobDelay, TimeUnit.NANOSECONDS.toMillis(remaining));
-                        if(maxWait < 1) {
+                        if(maxWait < 1 || !running) {
                             continue;//wait(0) will cause infinite wait.
                         }
                         if(networkUtil instanceof NetworkEventProvider) {
@@ -468,111 +721,6 @@ public class JobManager implements NetworkEventProvider.Listener {
         }
     };
 
-    /**
-     * Deprecated, please use {@link #addJob(Job)}.
-     *
-     * <p>Adds a job with given priority and returns the JobId.</p>
-     * @param priority Higher runs first
-     * @param baseJob The actual job to run
-     * @return job id
-     */
-    @Deprecated
-    public long addJob(int priority, BaseJob baseJob) {
-        return addJob(priority, 0, baseJob);
-    }
-
-    /**
-     * Deprecated, please use {@link #addJob(Job)}.
-     *
-     * <p>Adds a job with given priority and returns the JobId.</p>
-     * @param priority Higher runs first
-     * @param delay number of milliseconds that this job should be delayed
-     * @param baseJob The actual job to run
-     * @return a job id. is useless for now but we'll use this to cancel jobs in the future.
-     */
-    @Deprecated
-    public long addJob(int priority, long delay, BaseJob baseJob) {
-        JobHolder jobHolder = new JobHolder(priority, baseJob, delay > 0 ? System.nanoTime() + delay * NS_PER_MS : NOT_DELAYED_JOB_DELAY, NOT_RUNNING_SESSION_ID);
-        long id;
-        if (baseJob.isPersistent()) {
-            synchronized (persistentJobQueue) {
-                id = persistentJobQueue.insert(jobHolder);
-                addOnAddedLock(persistentOnAddedLocks, id);
-            }
-        } else {
-            synchronized (nonPersistentJobQueue) {
-                id = nonPersistentJobQueue.insert(jobHolder);
-                addOnAddedLock(nonPersistentOnAddedLocks, id);
-            }
-        }
-        if(JqLog.isDebugEnabled()) {
-            JqLog.d("added job id: %d class: %s priority: %d delay: %d group : %s persistent: %s requires network: %s"
-                    , id, baseJob.getClass().getSimpleName(), priority, delay, baseJob.getRunGroupId()
-                    , baseJob.isPersistent(), baseJob.requiresNetwork());
-        }
-        if(dependencyInjector != null) {
-            //inject members b4 calling onAdded
-            dependencyInjector.inject(baseJob);
-        }
-        jobHolder.getBaseJob().onAdded();
-        if(baseJob.isPersistent()) {
-            synchronized (persistentJobQueue) {
-                clearOnAddedLock(persistentOnAddedLocks, id);
-            }
-        } else {
-            synchronized (nonPersistentJobQueue) {
-                clearOnAddedLock(nonPersistentOnAddedLocks, id);
-            }
-        }
-        notifyJobConsumer();
-        return id;
-    }
-
-    /**
-     * Please use {@link #addJobInBackground(Job)}.
-     * <p>Non-blocking convenience method to add a job in background thread.</p>
-     *
-     * @see #addJob(int, BaseJob) addJob(priority, job).
-     */
-    @Deprecated
-    public void addJobInBackground(final int priority, final BaseJob baseJob) {
-        timedExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                addJob(priority, baseJob);
-            }
-        });
-    }
-
-    /**
-     * Deprecated, please use {@link #addJobInBackground(Job)}.
-     * <p></p>Non-blocking convenience method to add a job in background thread.</p>
-     * @see #addJob(int, long, BaseJob) addJob(priority, delay, job).
-     */
-    @Deprecated
-    public void addJobInBackground(final int priority, final long delay, final BaseJob baseJob) {
-        addJobInBackground(priority, delay, baseJob, null);
-    }
-
-    protected void addJobInBackground(final int priority, final long delay, final BaseJob baseJob,
-        /*nullable*/final AsyncAddCallback callback) {
-        final long callTime = System.nanoTime();
-        timedExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final long runDelay = (System.nanoTime() - callTime) / NS_PER_MS;
-                    long id = addJob(priority, Math.max(0, delay - runDelay), baseJob);
-                    if(callback != null) {
-                        callback.onAdded(id);
-                    }
-                } catch (Throwable t) {
-                    JqLog.e(t, "addJobInBackground received an exception. job class: %s", baseJob.getClass().getSimpleName() );
-                }
-            }
-        });
-    }
-
 
     /**
      * Default implementation of QueueFactory that creates one {@link SqliteJobQueue} and one {@link NonPersistentPriorityQueue}
@@ -590,12 +738,16 @@ public class JobManager implements NetworkEventProvider.Listener {
         }
 
         @Override
-        public JobQueue createPersistentQueue(Context context, Long sessionId, String id) {
-            return new CachedJobQueue(new SqliteJobQueue(context, sessionId, id, jobSerializer));
+        public JobQueue createPersistentQueue(Context context, Long sessionId, String id,
+                boolean inTestMode) {
+            return new CachedJobQueue(new SqliteJobQueue(context, sessionId, id, jobSerializer,
+                    inTestMode));
         }
+
         @Override
-        public JobQueue createNonPersistent(Context context, Long sessionId, String id) {
-            return new CachedJobQueue(new NonPersistentPriorityQueue(sessionId, id));
+        public JobQueue createNonPersistent(Context context, Long sessionId, String id,
+                boolean inTestMode) {
+            return new CachedJobQueue(new NonPersistentPriorityQueue(sessionId, id, inTestMode));
         }
     }
 }

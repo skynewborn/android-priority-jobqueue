@@ -1,11 +1,17 @@
 package com.path.android.jobqueue.executor;
 
+import com.path.android.jobqueue.Job;
 import com.path.android.jobqueue.JobHolder;
 import com.path.android.jobqueue.JobManager;
 import com.path.android.jobqueue.JobQueue;
+import com.path.android.jobqueue.TagConstraint;
 import com.path.android.jobqueue.config.Configuration;
 import com.path.android.jobqueue.log.JqLog;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -107,15 +113,20 @@ public class JobConsumerExecutor {
     }
 
     private void onBeforeRun(JobHolder jobHolder) {
-        runningJobHolders.put(createRunningJobHolderKey(jobHolder), jobHolder);
+        synchronized (runningJobHolders) {
+            runningJobHolders.put(createRunningJobHolderKey(jobHolder), jobHolder);
+        }
     }
 
     private void onAfterRun(JobHolder jobHolder) {
-        runningJobHolders.remove(createRunningJobHolderKey(jobHolder));
+        synchronized (runningJobHolders) {
+            runningJobHolders.remove(createRunningJobHolderKey(jobHolder));
+            runningJobHolders.notifyAll();
+        }
     }
 
     private String createRunningJobHolderKey(JobHolder jobHolder) {
-        return createRunningJobHolderKey(jobHolder.getId(), jobHolder.getBaseJob().isPersistent());
+        return createRunningJobHolderKey(jobHolder.getId(), jobHolder.getJob().isPersistent());
     }
 
     private String createRunningJobHolderKey(long id, boolean isPersistent) {
@@ -129,7 +140,101 @@ public class JobConsumerExecutor {
      * @return true if job is currently handled here
      */
     public boolean isRunning(long id, boolean persistent) {
-        return runningJobHolders.containsKey(createRunningJobHolderKey(id, persistent));
+        synchronized (runningJobHolders) {
+            return runningJobHolders.containsKey(createRunningJobHolderKey(id, persistent));
+        }
+    }
+
+    public void waitUntilDone(Set<Long> persistentJobIds, Set<Long> nonPersistentJobIds)
+            throws InterruptedException {
+        List<String> ids = new ArrayList<String>();
+        for (Long id : persistentJobIds) {
+            ids.add(createRunningJobHolderKey(id, true));
+        }
+        for (Long id : nonPersistentJobIds) {
+            ids.add(createRunningJobHolderKey(id, false));
+        }
+        synchronized (runningJobHolders) {
+            while (containsAny(ids)) {
+                runningJobHolders.wait();
+            }
+        }
+    }
+
+    private boolean containsAny(List<String> ids) {
+        for (String id : ids) {
+            if (runningJobHolders.containsKey(id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void inRunningJobHoldersLock(Runnable runnable) {
+        synchronized (runnable) {
+            runnable.run();;
+        }
+    }
+
+    /**
+     * Excludes cancelled jobs
+     */
+    public Set<JobHolder> findRunningByTags(TagConstraint constraint, String[] tags,
+            boolean persistent) {
+        Set<JobHolder> result = new HashSet<JobHolder>();
+        synchronized (runningJobHolders) {
+            for (JobHolder holder : runningJobHolders.values()) {
+                JqLog.d("checking job tag %s. tags of job: %s", holder.getJob(), holder.getJob().getTags());
+                if (!holder.hasTags() || persistent != holder.getJob().isPersistent()) {
+                    continue;
+                }
+                if (holder.isCancelled()) {
+                    continue;
+                }
+                if (doesHolderMatchTags(holder, constraint, tags)) {
+                    result.add(holder);
+                }
+            }
+        }
+        return result;
+    }
+
+    private boolean doesHolderMatchTags(JobHolder holder, TagConstraint constraint, String[] tags) {
+        if (constraint == TagConstraint.ANY) {
+            for (String tag : holder.getTags()) {
+                if (contains(tags, tag)) {
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            final Set<String> holderTags = holder.getTags();
+            for (String tag : tags) {
+                if (!holderTags.contains(tag)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    private boolean contains(String[] arr, String val) {
+        for (int i = 0; i < arr.length; i ++) {
+            if (val.equals(arr[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void waitUntilAllConsumersAreFinished() throws InterruptedException {
+        Thread[] threads = new Thread[threadGroup.activeCount() * 3];
+        threadGroup.enumerate(threads);
+        for (Thread thread : threads) {
+            if (thread != null) {
+                thread.join();
+            }
+        }
     }
 
     /**
@@ -198,10 +303,23 @@ public class JobConsumerExecutor {
                         nextJob = contract.isRunning() ? contract.getNextJob(executor.keepAliveSeconds, TimeUnit.SECONDS) : null;
                         if (nextJob != null) {
                             executor.onBeforeRun(nextJob);
-                            if (nextJob.safeRun(nextJob.getRunCount())) {
-                                contract.removeJob(nextJob);
-                            } else {
-                                contract.insertOrReplace(nextJob);
+                            int result = nextJob.safeRun(nextJob.getRunCount());
+                            switch (result) {
+                                case JobHolder.RUN_RESULT_SUCCESS:
+                                    nextJob.markAsSuccessful();
+                                    contract.removeJob(nextJob);
+                                    break;
+                                case JobHolder.RUN_RESULT_FAIL_RUN_LIMIT:
+                                    contract.removeJob(nextJob);
+                                    break;
+                                case JobHolder.RUN_RESULT_TRY_AGAIN:
+                                    contract.insertOrReplace(nextJob);
+                                    break;
+                                case JobHolder.RUN_RESULT_FAIL_FOR_CANCEL:
+                                    JqLog.d("running job failed and cancelled, doing nothing. "
+                                            + "Will be removed after it's onCancel is called by the "
+                                            + "JobManager");
+                                    break;
                             }
                             executor.onAfterRun(nextJob);
                         }
