@@ -76,7 +76,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insert with sql exception.");
             } finally {
-                db.endTransaction();
+                try {
+                    db.endTransaction();
+                } catch (SQLException e) {
+                    JqLog.e(e, "end transaction with sql exception.");
+                }
             }
         }
         jobHolder.setId(id);
@@ -102,7 +106,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insertWithTags with sql exception.");
             } finally {
-                db.endTransaction();
+                try {
+                    db.endTransaction();
+                } catch (SQLException e) {
+                    JqLog.e(e, "end transaction with sql exception.");
+                }
             }
         }
         jobHolder.setId(id);
@@ -154,7 +162,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insertOrReplace with sql exception.");
             } finally {
-                db.endTransaction();
+                try {
+                    db.endTransaction();
+                } catch (SQLException e) {
+                    JqLog.e(e, "end transaction with sql exception.");
+                }
             }
         }
         jobHolder.setId(id);
@@ -186,7 +198,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called delete with sql exception.");
             } finally {
-                db.endTransaction();
+                try {
+                    db.endTransaction();
+                } catch (SQLException e) {
+                    JqLog.e(e, "end transaction with sql exception.");
+                }
             }
         }
     }
@@ -399,7 +415,11 @@ public class SqliteJobQueue implements JobQueue {
         } catch (SQLException e) {
             JqLog.e(e, "called clear with sql exception.");
         } finally {
-            db.endTransaction();
+            try {
+                db.endTransaction();
+            } catch (SQLException e) {
+                JqLog.e(e, "end transaction with sql exception.");
+            }
         }
         readyJobsQueryCache.clear();
         nextJobsQueryCache.clear();
@@ -429,7 +449,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called setSessionIdOnJob with sql exception.");
             } finally {
-                db.endTransaction();
+                try {
+                    db.endTransaction();
+                } catch (SQLException e) {
+                    JqLog.e(e, "end transaction with sql exception.");
+                }
             }
         }
     }
