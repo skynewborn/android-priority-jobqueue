@@ -5,9 +5,9 @@ apply plugin: 'com.android.library'
 /*Properties releaseConfig = new Properties()
 releaseConfig.load(new FileInputStream("${projectDir}/releaseConfig.properties"))
 ext.releaseConfig = releaseConfig*/
-task wrapper(type: Wrapper) {
-    gradleVersion = '2.2.1'
-}
+//task wrapper(type: Wrapper) {
+//    gradleVersion = '2.2.1'
+//}
 
 apply plugin: 'maven'
 apply plugin: 'signing'
@@ -31,7 +31,7 @@ dependencies {
 
 
 android {
-    compileSdkVersion 21
+    compileSdkVersion 22
     buildToolsVersion "22.0.1"
     buildTypes {
         debug {

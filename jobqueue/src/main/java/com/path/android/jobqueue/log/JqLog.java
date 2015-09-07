@@ -35,7 +35,9 @@ public class JqLog {
     }
 
     public static void d(String text, Object... args) {
-        customLogger.d(text, args);
+        if (isDebugEnabled()) {
+            customLogger.d(text, args);
+        }
     }
 
     public static void e(Throwable t, String text, Object... args) {
