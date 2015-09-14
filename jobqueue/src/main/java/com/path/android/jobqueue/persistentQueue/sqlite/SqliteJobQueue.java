@@ -234,10 +234,13 @@ public class SqliteJobQueue implements JobQueue {
         }
         Cursor cursor = db.rawQuery(sql, new String[]{Long.toString(sessionId), Long.toString(System.nanoTime())});
         try {
-            if(!cursor.moveToNext()) {
+            if (!cursor.moveToFirst()) {
                 return 0;
             }
             return cursor.getInt(0);
+        } catch (Throwable e) {
+            JqLog.e(e, "count ready jobs with exception.");
+            return 0;
         } finally {
             cursor.close();
         }
@@ -250,7 +253,7 @@ public class SqliteJobQueue implements JobQueue {
     public JobHolder findJobById(long id) {
         Cursor cursor = db.rawQuery(sqlHelper.FIND_BY_ID_QUERY, new String[]{Long.toString(id)});
         try {
-            if(!cursor.moveToFirst()) {
+            if (!cursor.moveToFirst()) {
                 return null;
             }
             return createJobHolderFromCursor(cursor);
@@ -335,7 +338,7 @@ public class SqliteJobQueue implements JobQueue {
             Cursor cursor = db.rawQuery(selectQuery,
                     new String[]{Long.toString(sessionId), Long.toString(System.nanoTime())});
             try {
-                if (!cursor.moveToNext()) {
+                if (!cursor.moveToFirst()) {
                     return null;
                 }
                 JobHolder holder = createJobHolderFromCursor(cursor);
