@@ -32,16 +32,17 @@ public class SqliteJobQueue implements JobQueue {
     JobSerializer jobSerializer;
     QueryCache readyJobsQueryCache;
     QueryCache nextJobsQueryCache;
+    QueryCache nextJobDelayUntilQueryCache;
     // we keep a list of cancelled jobs in memory not to return them in subsequent find by tag
     // queries. Set is cleaned when item is removed
     Set<Long> pendingCancelations = new HashSet<Long>();
-
+    
     /**
-     * @param context application context
-     * @param sessionId session id should match {@link JobManager}
-     * @param id uses this value to construct database name {@code "db_" + id}
+     * @param context       application context
+     * @param sessionId     session id should match {@link JobManager}
+     * @param id            uses this value to construct database name {@code "db_" + id}
      * @param jobSerializer The serializer to use while persisting jobs to database
-     * @param inTestMode If true, creates a memory only database
+     * @param inTestMode    If true, creates a memory only database
      */
     public SqliteJobQueue(Context context, long sessionId, String id, JobSerializer jobSerializer,
             boolean inTestMode) {
@@ -53,9 +54,10 @@ public class SqliteJobQueue implements JobQueue {
         this.jobSerializer = jobSerializer;
         readyJobsQueryCache = new QueryCache();
         nextJobsQueryCache = new QueryCache();
+        nextJobDelayUntilQueryCache = new QueryCache();
         sqlHelper.resetDelayTimesTo(JobManager.NOT_DELAYED_JOB_DELAY);
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -76,17 +78,13 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insert with sql exception.");
             } finally {
-                try {
-                    db.endTransaction();
-                } catch (SQLException e) {
-                    JqLog.e(e, "end transaction with sql exception.");
-                }
+                safeEndTransaction();
             }
         }
         jobHolder.setId(id);
         return id;
     }
-
+    
     private long insertWithTags(JobHolder jobHolder) {
         final SQLiteStatement stmt = sqlHelper.getInsertStatement();
         final SQLiteStatement tagsStmt = sqlHelper.getInsertTagsStatement();
@@ -106,28 +104,24 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insertWithTags with sql exception.");
             } finally {
-                try {
-                    db.endTransaction();
-                } catch (SQLException e) {
-                    JqLog.e(e, "end transaction with sql exception.");
-                }
+                safeEndTransaction();
             }
         }
         jobHolder.setId(id);
         return id;
     }
-
+    
     private void bindTag(SQLiteStatement stmt, long jobId, String tag) {
         stmt.bindLong(DbOpenHelper.TAGS_JOB_ID_COLUMN.columnIndex + 1, jobId);
         stmt.bindString(DbOpenHelper.TAGS_NAME_COLUMN.columnIndex + 1, tag);
     }
-
+    
     private void bindValues(SQLiteStatement stmt, JobHolder jobHolder) {
         if (jobHolder.getId() != null) {
             stmt.bindLong(DbOpenHelper.ID_COLUMN.columnIndex + 1, jobHolder.getId());
         }
         stmt.bindLong(DbOpenHelper.PRIORITY_COLUMN.columnIndex + 1, jobHolder.getPriority());
-        if(jobHolder.getGroupId() != null) {
+        if (jobHolder.getGroupId() != null) {
             stmt.bindString(DbOpenHelper.GROUP_ID_COLUMN.columnIndex + 1, jobHolder.getGroupId());
         }
         stmt.bindLong(DbOpenHelper.RUN_COUNT_COLUMN.columnIndex + 1, jobHolder.getRunCount());
@@ -138,9 +132,10 @@ public class SqliteJobQueue implements JobQueue {
         stmt.bindLong(DbOpenHelper.CREATED_NS_COLUMN.columnIndex + 1, jobHolder.getCreatedNs());
         stmt.bindLong(DbOpenHelper.DELAY_UNTIL_NS_COLUMN.columnIndex + 1, jobHolder.getDelayUntilNs());
         stmt.bindLong(DbOpenHelper.RUNNING_SESSION_ID_COLUMN.columnIndex + 1, jobHolder.getRunningSessionId());
-        stmt.bindLong(DbOpenHelper.REQUIRES_NETWORK_COLUMN.columnIndex + 1, jobHolder.requiresNetwork() ? 1L : 0L);
+        stmt.bindLong(DbOpenHelper.REQUIRES_NETWORK_COLUMN.columnIndex + 1,
+                jobHolder.requiresNetwork() ? 1L : 0L);
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -162,17 +157,13 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called insertOrReplace with sql exception.");
             } finally {
-                try {
-                    db.endTransaction();
-                } catch (SQLException e) {
-                    JqLog.e(e, "end transaction with sql exception.");
-                }
+                safeEndTransaction();
             }
         }
         jobHolder.setId(id);
         return id;
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -184,7 +175,7 @@ public class SqliteJobQueue implements JobQueue {
         }
         delete(jobHolder.getId());
     }
-
+    
     private void delete(Long id) {
         pendingCancelations.remove(id);
         SQLiteStatement stmt = sqlHelper.getDeleteStatement();
@@ -198,15 +189,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called delete with sql exception.");
             } finally {
-                try {
-                    db.endTransaction();
-                } catch (SQLException e) {
-                    JqLog.e(e, "end transaction with sql exception.");
-                }
+                safeEndTransaction();
             }
         }
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -219,11 +206,11 @@ public class SqliteJobQueue implements JobQueue {
             return (int) stmt.simpleQueryForLong();
         }
     }
-
+    
     @Override
     public int countReadyJobs(boolean hasNetwork, Collection<String> excludeGroups) {
         String sql = readyJobsQueryCache.get(hasNetwork, excludeGroups);
-        if(sql == null) {
+        if (sql == null) {
             String where = createReadyJobWhereSql(hasNetwork, excludeGroups, true);
             String subSelect = "SELECT count(*) group_cnt, " + DbOpenHelper.GROUP_ID_COLUMN.columnName
                     + " FROM " + DbOpenHelper.JOB_HOLDER_TABLE_NAME
@@ -245,7 +232,7 @@ public class SqliteJobQueue implements JobQueue {
             cursor.close();
         }
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -264,7 +251,7 @@ public class SqliteJobQueue implements JobQueue {
             cursor.close();
         }
     }
-
+    
     @Override
     public Set<JobHolder> findJobsByTags(TagConstraint tagConstraint, boolean excludeCancelled,
             Collection<Long> exclude, String... tags) {
@@ -287,11 +274,11 @@ public class SqliteJobQueue implements JobQueue {
             System.arraycopy(tags, 0, args, 0, tags.length);
             int i = tags.length;
             for (Long ex : exclude) {
-                args[i ++] = ex.toString();
+                args[i++] = ex.toString();
             }
             if (excludeCancelled) {
                 for (Long ex : pendingCancelations) {
-                    args[i ++] = ex.toString();
+                    args[i++] = ex.toString();
                 }
             }
         }
@@ -307,13 +294,13 @@ public class SqliteJobQueue implements JobQueue {
         }
         return jobs;
     }
-
+    
     @Override
     public void onJobCancelled(JobHolder holder) {
         pendingCancelations.add(holder.getId());
         setSessionIdOnJob(holder);
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -354,58 +341,66 @@ public class SqliteJobQueue implements JobQueue {
             }
         }
     }
-
+    
     private String createReadyJobWhereSql(boolean hasNetwork, Collection<String> excludeGroups, boolean groupByRunningGroup) {
         String where = DbOpenHelper.RUNNING_SESSION_ID_COLUMN.columnName + " != ? "
                 + " AND " + DbOpenHelper.DELAY_UNTIL_NS_COLUMN.columnName + " <= ? ";
-        if(hasNetwork == false) {
+        if (hasNetwork == false) {
             where += " AND " + DbOpenHelper.REQUIRES_NETWORK_COLUMN.columnName + " != 1 ";
         }
         String groupConstraint = null;
-        if(excludeGroups != null && excludeGroups.size() > 0) {
+        if (excludeGroups != null && excludeGroups.size() > 0) {
             groupConstraint = DbOpenHelper.GROUP_ID_COLUMN.columnName + " IS NULL OR " +
-                    DbOpenHelper.GROUP_ID_COLUMN.columnName + " NOT IN('" + joinStrings("','", excludeGroups) + "')";
+                    DbOpenHelper.GROUP_ID_COLUMN.columnName + " NOT IN('" +
+                    SqlHelper.joinStrings("','", excludeGroups) + "')";
         }
-        if(groupByRunningGroup) {
+        if (groupByRunningGroup) {
             where += " GROUP BY " + DbOpenHelper.GROUP_ID_COLUMN.columnName;
-            if(groupConstraint != null) {
+            if (groupConstraint != null) {
                 where += " HAVING " + groupConstraint;
             }
-        } else if(groupConstraint != null) {
+        } else if (groupConstraint != null) {
             where += " AND ( " + groupConstraint + " )";
         }
         return where;
     }
-
-    private static String joinStrings(String glue, Collection<String> strings) {
-        StringBuilder builder = new StringBuilder();
-        for(String str : strings) {
-            if(builder.length() != 0) {
-                builder.append(glue);
-            }
-            builder.append(str);
-        }
-        return builder.toString();
-    }
-
+    
     /**
      * {@inheritDoc}
      */
     @Override
-    public Long getNextJobDelayUntilNs(boolean hasNetwork) {
-        SQLiteStatement stmt =
-                hasNetwork ? sqlHelper.getNextJobDelayedUntilWithNetworkStatement()
-                : sqlHelper.getNextJobDelayedUntilWithoutNetworkStatement();
-        synchronized (stmt) {
+    public Long getNextJobDelayUntilNs(boolean hasNetwork, Collection<String> excludeGroups) {
+        boolean hasExcludes = excludeGroups != null && !excludeGroups.isEmpty();
+        if (!hasExcludes) {
+            SQLiteStatement stmt =
+                    hasNetwork ? sqlHelper.getNextJobDelayedUntilWithNetworkStatement()
+                            : sqlHelper.getNextJobDelayedUntilWithoutNetworkStatement();
+            synchronized (stmt) {
+                try {
+                    stmt.clearBindings();
+                    return stmt.simpleQueryForLong();
+                } catch (SQLiteDoneException e) {
+                    return null;
+                }
+            }
+        } else {
+            String sql = nextJobDelayUntilQueryCache.get(hasNetwork, excludeGroups);
+            if (sql == null) {
+                sql = sqlHelper.createNextJobDelayUntilQuery(hasNetwork, excludeGroups);
+                nextJobDelayUntilQueryCache.set(sql, hasNetwork, excludeGroups);
+            }
+            Cursor cursor = db.rawQuery(sql, new String[0]);
             try {
-                stmt.clearBindings();
-                return stmt.simpleQueryForLong();
-            } catch (SQLiteDoneException e){
-                return null;
+                if (!cursor.moveToNext()) {
+                    return null;
+                }
+                return cursor.getLong(0);
+            } finally {
+                cursor.close();
             }
         }
     }
-
+    
     /**
      * {@inheritDoc}
      */
@@ -418,16 +413,12 @@ public class SqliteJobQueue implements JobQueue {
         } catch (SQLException e) {
             JqLog.e(e, "called clear with sql exception.");
         } finally {
-            try {
-                db.endTransaction();
-            } catch (SQLException e) {
-                JqLog.e(e, "end transaction with sql exception.");
-            }
+            safeEndTransaction();
         }
         readyJobsQueryCache.clear();
         nextJobsQueryCache.clear();
     }
-
+    
     /**
      * This method is called when a job is pulled to run.
      * It is properly marked so that it won't be returned from next job queries.
@@ -452,15 +443,11 @@ public class SqliteJobQueue implements JobQueue {
             } catch (SQLException e) {
                 JqLog.e(e, "called setSessionIdOnJob with sql exception.");
             } finally {
-                try {
-                    db.endTransaction();
-                } catch (SQLException e) {
-                    JqLog.e(e, "end transaction with sql exception.");
-                }
+                safeEndTransaction();
             }
         }
     }
-
+    
     private JobHolder createJobHolderFromCursor(Cursor cursor) throws InvalidJobException {
         Job job = safeDeserialize(cursor.getBlob(DbOpenHelper.BASE_JOB_COLUMN.columnIndex));
         if (job == null) {
@@ -476,9 +463,17 @@ public class SqliteJobQueue implements JobQueue {
                 cursor.getLong(DbOpenHelper.DELAY_UNTIL_NS_COLUMN.columnIndex),
                 cursor.getLong(DbOpenHelper.RUNNING_SESSION_ID_COLUMN.columnIndex)
         );
-
+        
     }
-
+    
+    private void safeEndTransaction() {
+        try {
+            db.endTransaction();
+        } catch (SQLException e) {
+            JqLog.e(e, "end transaction with sql exception.");
+        }
+    }
+    
     private Job safeDeserialize(byte[] bytes) {
         try {
             return jobSerializer.deserialize(bytes);
@@ -487,11 +482,11 @@ public class SqliteJobQueue implements JobQueue {
         }
         return null;
     }
-
+    
     private byte[] getSerializeJob(JobHolder jobHolder) {
         return safeSerialize(jobHolder.getJob());
     }
-
+    
     private byte[] safeSerialize(Object object) {
         try {
             return jobSerializer.serialize(object);
@@ -500,13 +495,13 @@ public class SqliteJobQueue implements JobQueue {
         }
         return null;
     }
-
+    
     private static class InvalidJobException extends Exception {
-
+        
     }
-
+    
     public static class JavaSerializer implements JobSerializer {
-
+        
         @Override
         public byte[] serialize(Object object) throws IOException {
             if (object == null) {
@@ -526,7 +521,7 @@ public class SqliteJobQueue implements JobQueue {
                 }
             }
         }
-
+        
         @Override
         public <T extends Job> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException {
             if (bytes == null || bytes.length == 0) {
@@ -543,9 +538,10 @@ public class SqliteJobQueue implements JobQueue {
             }
         }
     }
-
+    
     public static interface JobSerializer {
         public byte[] serialize(Object object) throws IOException;
+        
         public <T extends Job> T deserialize(byte[] bytes) throws IOException, ClassNotFoundException;
     }
 }
