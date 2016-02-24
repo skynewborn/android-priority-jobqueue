@@ -3,15 +3,36 @@ import java.util.regex.Pattern
 apply plugin: 'com.android.library'
 
 /*Properties releaseConfig = new Properties()
-releaseConfig.load(new FileInputStream("${projectDir}/releaseConfig.properties"))
+File releaseFile = new File("${projectDir}/releaseConfig.properties")
+if (releaseFile.exists()) {
+    releaseConfig.load(new FileInputStream(releaseFile))
+}
+
 ext.releaseConfig = releaseConfig*/
+
 task wrapper(type: Wrapper) {
-    gradleVersion = '2.6'
+    gradleVersion = '2.10'
 }
 
 apply plugin: 'maven'
 apply plugin: 'signing'
 apply plugin: 'jacoco'
+
+buildscript {
+    repositories {
+        jcenter()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:1.5.0'
+
+    }
+}
+
+repositories {
+    mavenCentral()
+    jcenter()
+}
 
 configurations {
     archives {
@@ -25,14 +46,12 @@ dependencies {
     testCompile 'org.hamcrest:hamcrest-core:1.3'
     testCompile 'org.easytesting:fest-util:1.2.5'
     testCompile 'org.easytesting:fest-reflect:1.4.1'
-
+    testCompile 'org.mockito:mockito-core:2.0.2-beta'
 }
-
-
 
 android {
     compileSdkVersion 23
-    buildToolsVersion "23.0.1"
+    buildToolsVersion "23.0.2"
     buildTypes {
         debug {
             testCoverageEnabled = true
@@ -55,10 +74,11 @@ def manifestVersionName = matcher.group(1)
 println "version name:${manifestVersionName}"
 
 //create jar tasks
+
 android.libraryVariants.all { variant ->
     def name = variant.buildType.name
     println "checking variant ${name}"
-    if (name.equals(com.android.builder.core.BuilderConstants.DEBUG)) {
+    if (variant.buildType.isDebuggable()) {
         return; // Skip debug builds.
     }
     def suffix = name.capitalize()
@@ -156,7 +176,7 @@ android.libraryVariants.all { variant ->
     }
 }*/
 
-task jacocoTestReport(type:JacocoReport, dependsOn: "testDebug") {
+task jacocoTestReport(type:JacocoReport, dependsOn: "testDebugUnitTest") {
     group = "Reporting"
 
     description = "Generate Jacoco coverage reports"
