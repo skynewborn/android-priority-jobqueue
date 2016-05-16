@@ -55,7 +55,7 @@ dependencies {
     // use an old version since we only need a few util classes that were already there for a long
     // time. If app depends on a newer one, gradle will pick it for us.
     compile 'com.android.support:support-v4:21.0.3'
-    // build tools does not allow makingt this provided so we make it optional when pom is created
+    // build tools does not allow making this provided so we make it optional when pom is created
     compile 'com.google.android.gms:play-services-gcm:8.4.0'
 
 }
