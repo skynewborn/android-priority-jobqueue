@@ -4,8 +4,8 @@ android:
     - tools
     - platform-tools
     - platform-tools-23.1
-    - tools-24.4.1
-    - build-tools-23.0.2
+    - tools-25.1.6
+    - build-tools-23.0.3
     - android-23
 script:
   gradle jarRelease
